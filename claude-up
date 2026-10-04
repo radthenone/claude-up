@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# claude-up - sesje Claude Code z Remote Control w tmux, per projekt
+# https://github.com/radthenone/claude-up
+set -euo pipefail
+
+VERSION="0.1.0"
+
+ROOT="${CLAUDE_UP_ROOT:-}"
+if [ -z "$ROOT" ]; then
+  if [ -d "$HOME/projects" ]; then ROOT="$HOME/projects"; else ROOT="$PWD"; fi
+fi
+
+usage() {
+  cat <<'EOF'
+usage: claude-up <sciezka> [nazwa]       # serwer remote-control dla repo (sciezka: od $HOME, ./, albo /bezwzgledna)
+       claude-up --all                # startuj kazde repo z $CLAUDE_UP_ROOT / ~/projects / $PWD
+       claude-up --list
+       claude-up --stop <nazwa-tmux>
+       claude-up --stop-all
+       claude-up --new [nazwa]        # w repo: nowe okno z interaktywnym claude --remote-control
+       claude-up --resume [uuid]      # w repo: wznow rozmowe (bez uuid: lista) w nowym oknie z --remote-control
+       claude-up --session [nr]       # lista zywych sesji claude w repo; z nr: podepnij (term) albo link (app)
+       claude-up --version
+example: claude-up projects/olivin-app "Olivin"
+         claude-up .
+nazwa:   domyslnie basename; nadpisz plikiem .claude-name w repo
+root:    $CLAUDE_UP_ROOT, inaczej ~/projects (jesli istnieje), inaczej $PWD
+EOF
+  exit 1
+}
+
+die() { echo "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "brak $1 w PATH"; }
+
+sname() { printf '%s' "$1" | tr '/ .' '-' | tr -cd 'A-Za-z0-9_-'; }
+
+# nazwa sesji tmux: sciezka wzgledem $HOME (poza $HOME: bezwzgledna bez wiodacego /)
+sess_for() { local p="${1#"$HOME/"}"; sname "${p#/}"; }
+
+label_for() {
+  local dir="$1" label="${2:-}"
+  [ -z "$label" ] && [ -f "$dir/.claude-name" ] && label="$(head -n1 "$dir/.claude-name")"
+  [ -z "$label" ] && label="$(basename "$dir")"
+  printf '%s' "$label"
+}
+
+check_label() {
+  case "$1" in *\'*) echo "nazwa nie moze zawierac apostrofu: $1" >&2; return 1 ;; esac
+}
+
+# sciezka z argumentu -> katalog bezwzgledny; wzgledna liczona od $HOME, a gdy tam nie ma - od $PWD
+resolve_dir() {
+  local p="$1"
+  case "$p" in
+    "~") p="$HOME" ;;
+    "~/"*) p="$HOME/${p#\~/}" ;;
+    /*) ;;
+    .|./*|..|../*) p="$PWD/$p" ;;
+    *) if [ -d "$HOME/$p" ]; then p="$HOME/$p"; else p="$PWD/$p"; fi ;;
+  esac
+  [ -d "$p" ] || die "brak katalogu: $p"
+  (cd "$p" && pwd)
+}
+
+repo_here() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
+
+each_repo() {
+  local d
+  for d in "$ROOT"/*/; do
+    [ -e "$d.git" ] || continue
+    printf '%s\n' "${d%/}"
+  done
+}
+
+go_window() {
+  tmux select-window -t "=$1:$2"
+  if [ -n "${TMUX:-}" ]; then tmux switch-client -t "=$1"; else tmux attach -t "=$1"; fi
+}
+
+start_one() {
+  local dir="$1" label session
+  label="$(label_for "$dir" "${2:-}")"
+  check_label "$label"
+  session="$(sess_for "$dir")"
+  if tmux has-session -t "=$session" 2>/dev/null; then
+    echo "juz dziala: $session"
+    return 0
+  fi
+
+  tmux new -d -s "$session" -c "$dir" \
+    "while :; do claude remote-control --spawn=same-dir --name '$label'; echo '[claude-up] wyszedl, restart za 5s'; sleep 5; done"
+  tmux set-option -t "=$session" @claude_up 1
+  echo "started $session -> \"$label\"  ($dir)"
+}
+
+# $1 = nazwa (opcjonalna), $2 = dodatkowe argumenty claude (np. " --resume <uuid>")
+new_chat() {
+  local dir session n label
+  dir="$(repo_here)"
+  session="$(sess_for "$dir")"
+  tmux has-session -t "=$session" 2>/dev/null || start_one "$dir"
+
+  n=$(( $(tmux list-windows -t "=$session" -F '#{window_index}' | sort -n | tail -1) + 1 ))
+  label="$(label_for "$dir" "${1:-}")"
+  [ -n "${1:-}" ] || label="$label #$n"
+  check_label "$label"
+
+  tmux new-window -d -t "=$session:$n" -n "chat-$n" -c "$dir" "claude --remote-control '$label'${2:-}"
+  echo "okno $n -> \"$label\"  (lista: claude-up --session)"
+  go_window "$session" "$n"
+}
+
+# zywe sesje claude z ~/.claude/sessions (filtr: katalog repo) -> TSV: nr nazwa status branch zrodlo url tmux
+# Format ~/.claude/sessions/*.json to wewnetrzny format Claude Code (testowane na 2.1.289) - moze sie zmienic.
+SESSIONS_PY=$(cat <<'PY'
+import glob, json, os, subprocess, sys
+
+def branch(cwd):
+    try:
+        out = subprocess.run(["git", "-C", cwd, "branch", "--show-current"],
+                             capture_output=True, text=True).stdout.strip()
+    except Exception:
+        out = ""
+    return out or "-"
+
+def main(pref):
+    rows = []
+    for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+        try:
+            with open(f) as fh:
+                d = json.load(fh)
+            os.kill(int(d["pid"]), 0)
+        except Exception:
+            continue
+        cwd = str(d.get("cwd", ""))
+        if pref and cwd != pref and not cwd.startswith(pref + "/"):
+            continue
+        rows.append(d)
+    rows.sort(key=lambda d: d.get("startedAt", 0) or 0)
+    for i, d in enumerate(rows, 1):
+        app = d.get("entrypoint") == "sdk-cli"
+        bid = d.get("bridgeSessionId") or ""
+        print("\t".join([str(i), str(d.get("name", "?")), str(d.get("status", "?")),
+                         branch(str(d.get("cwd", "."))),
+                         "app" if app else "term",
+                         "https://claude.ai/code/" + bid if bid else "-",
+                         "" if app else str(d.get("tmux") or "")]))
+
+try:
+    main(sys.argv[1])
+except Exception as e:
+    sys.exit("nie moge odczytac ~/.claude/sessions (zmieniony format Claude Code?): %s" % e)
+PY
+)
+
+attach_chat() {
+  local pref="" rows row kind url tm sess win
+  pref="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  rows="$(python3 -c "$SESSIONS_PY" "$pref")"
+
+  if [ -z "${1:-}" ]; then
+    [ -n "$rows" ] || { echo "brak aktywnych sesji${pref:+ w $pref}"; return 0; }
+    printf '%s\n' "$rows" | awk -F'\t' '{printf "%2s  %-28s %-8s %-20s %-4s  %s\n",$1,$2,$3,$4,$5,$6}'
+    return 0
+  fi
+
+  row="$(printf '%s\n' "$rows" | awk -F'\t' -v n="$1" '$1==n')"
+  [ -n "$row" ] || die "brak sesji nr $1 (lista: claude-up --session)"
+  kind="$(cut -f5 <<<"$row")"; url="$(cut -f6 <<<"$row")"; tm="$(cut -f7 <<<"$row")"
+  if [ "$kind" = app ] || [ -z "$tm" ]; then
+    echo "sesja odpalona z aplikacji - nie ma terminala do podpiecia"
+    echo "otworz: $url"
+    echo "przejecie do terminala: zarchiwizuj ja w apce, potem: claude-up --resume"
+    return 0
+  fi
+  sess="${tm%%:*}"; win="${tm#*:}"; win="${win%%.*}"
+  tmux select-window -t "$win"
+  if [ -n "${TMUX:-}" ]; then tmux switch-client -t "=$sess"; else tmux attach -t "=$sess"; fi
+}
+
+case "${1:-}" in
+  ""|-h|--help) usage ;;
+  -V|--version) echo "claude-up $VERSION"; exit 0 ;;
+esac
+
+need tmux
+
+case "$1" in
+  --list) tmux ls 2>/dev/null || echo "brak sesji"; exit 0 ;;
+
+  --session) need python3; attach_chat "${2:-}"; exit 0 ;;
+
+  --stop)
+    [ -n "${2:-}" ] || usage
+    tmux kill-session -t "=$2" || exit 1
+    echo "stopped $2"
+    exit 0
+    ;;
+
+  --stop-all)
+    found=0
+    while read -r s; do
+      [ -n "$s" ] || continue
+      tag="$(tmux show-options -qv -t "=$s" @claude_up 2>/dev/null || true)"
+      cmd="$(tmux list-panes -s -t "=$s" -F '#{pane_start_command}' 2>/dev/null | tr '\n' ' ')"
+      case "$tag$cmd" in
+        1*|*"claude remote-control"*)
+          tmux kill-session -t "=$s" && echo "stopped $s"
+          found=1
+          ;;
+      esac
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+    [ "$found" = 1 ] || echo "brak sesji claude-up"
+    exit 0
+    ;;
+
+  --all|--new|--resume) ;;                   # obsluzone nizej, po sprawdzeniu auth
+  --*) echo "nieznana opcja: $1" >&2; usage ;;
+esac
+
+need claude
+claude auth status >/dev/null 2>&1 || die "claude niezalogowany - odpal: claude setup-token"
+
+case "$1" in
+  --new) new_chat "${2:-}" ;;
+
+  --resume)
+    if [ -n "${2:-}" ] && [[ ! "$2" =~ ^[0-9a-f-]+$ ]]; then
+      die "podaj lokalne UUID (nie ID z linku) albo nic - wtedy lista"
+    fi
+    new_chat "" " --resume ${2:-}"
+    ;;
+
+  --all)
+    rc=0
+    while read -r d; do start_one "$d" || rc=1; done < <(each_repo)
+    exit "$rc"
+    ;;
+
+  *)
+    dir="$(resolve_dir "$1")"
+    start_one "$dir" "${2:-}"
+    ;;
+esac
