@@ -14,12 +14,24 @@ Piszesz z Claude w terminalu (SSH, Orca, cokolwiek). Kiedy zamkniesz terminal, s
 ## Instalacja
 
 ```bash
-mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/radthenone/claude-up/main/claude-up -o ~/.local/bin/claude-up
-chmod +x ~/.local/bin/claude-up
+curl -fsSL https://raw.githubusercontent.com/radthenone/claude-up/main/install.sh | bash
 ```
 
-`~/.local/bin` musi być w `PATH`. Aktualizacja to ta sama komenda. Konkretną wersję dostaniesz, podmieniając `main` w URL na tag, np. `v0.1.0`.
+Instalator sam wybiera katalog:
+- jeśli `claude-up` jest już zainstalowany, aktualizuje go w tym samym miejscu,
+- dla roota instaluje do `/usr/local/bin`,
+- w pozostałych przypadkach do `~/.local/bin`.
+
+Na koniec sprawdza zależności i podpowiada, co dopisać, jeśli katalog nie jest w `PATH`. Aktualizacja to ta sama komenda.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/radthenone/claude-up/main/install.sh | CLAUDE_UP_VERSION=v0.1.0 bash  # konkretna wersja
+curl -fsSL https://raw.githubusercontent.com/radthenone/claude-up/main/install.sh | CLAUDE_UP_BIN=/opt/bin bash     # własny katalog
+```
+
+**Windows:** tylko przez WSL (`wsl --install`), bo natywnie nie ma tmux. Instalator uruchom w terminalu WSL.
+
+Odinstalowanie: `rm "$(command -v claude-up)"`.
 
 ## Użycie
 
@@ -51,7 +63,7 @@ claude-up --stop-all                     # wszystkie sesje claude-up
 ## Terminal czy aplikacja
 
 | Gdzie zakładasz sesję | Terminal | Aplikacja |
-|---|---|---|
+| --- | --- | --- |
 | `claude-up --new` / `--resume` | tak | tak |
 | w aplikacji (przez serwer z `claude-up .`) | nie | tak |
 
@@ -60,7 +72,7 @@ Sesja założona w aplikacji działa bez terminala, więc nie da się jej podpi�
 ## Konfiguracja
 
 | Co | Jak |
-|---|---|
+| --- | --- |
 | Katalog projektów dla `--all` | `export CLAUDE_UP_ROOT=~/code`. Bez zmiennej: `~/projects`, a gdy go nie ma, bieżący katalog |
 | Nazwa sesji w aplikacji | plik `.claude-name` w repo (pierwsza linia), domyślnie nazwa katalogu |
 
