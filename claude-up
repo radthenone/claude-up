@@ -46,6 +46,8 @@ label_for() {
 
 check_label() {
   case "$1" in *\'*) echo "nazwa nie moze zawierac apostrofu: $1" >&2; return 1 ;; esac
+  case "$1" in *$'\n'*) echo "nazwa nie moze zawierac nowej linii" >&2; return 1 ;; esac
+  [ "${#1}" -le 60 ] || { echo "nazwa za dluga (max 60 znakow): $1" >&2; return 1; }
 }
 
 # sciezka z argumentu -> katalog bezwzgledny; wzgledna liczona od $HOME, a gdy tam nie ma - od $PWD
@@ -60,6 +62,15 @@ resolve_dir() {
   esac
   [ -d "$p" ] || die "brak katalogu: $p"
   (cd "$p" && pwd)
+}
+
+# sesja tmux od claude-up: znacznik @claude_up albo panel z "claude remote-control" (starsze sesje bez znacznika)
+is_ours() {
+  local tag cmd
+  tag="$(tmux show-options -qv -t "=$1" @claude_up 2>/dev/null || true)"
+  cmd="$(tmux list-panes -s -t "=$1" -F '#{pane_start_command}' 2>/dev/null | tr '\n' ' ')"
+  case "$tag$cmd" in 1*|*"claude remote-control"*) return 0 ;; esac
+  return 1
 }
 
 repo_here() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
@@ -89,7 +100,7 @@ start_one() {
 
   tmux new -d -s "$session" -c "$dir" \
     "while :; do claude remote-control --spawn=same-dir --name '$label'; echo '[claude-up] wyszedl, restart za 5s'; sleep 5; done"
-  tmux set-option -t "=$session" @claude_up 1
+  tmux set-option -t "$session" @claude_up 1   # tmux 3.2a: set-option nie przyjmuje prefiksu "="
   echo "started $session -> \"$label\"  ($dir)"
 }
 
@@ -174,7 +185,7 @@ attach_chat() {
     return 0
   fi
   sess="${tm%%:*}"; win="${tm#*:}"; win="${win%%.*}"
-  tmux select-window -t "$win"
+  tmux select-window -t "=$sess:$win"
   if [ -n "${TMUX:-}" ]; then tmux switch-client -t "=$sess"; else tmux attach -t "=$sess"; fi
 }
 
@@ -186,7 +197,13 @@ esac
 need tmux
 
 case "$1" in
-  --list) tmux ls 2>/dev/null || echo "brak sesji"; exit 0 ;;
+  --list)
+    out="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | while read -r s; do
+      is_ours "$s" && tmux ls -f "#{==:#{session_name},$s}"
+    done || true)"
+    [ -n "$out" ] && printf '%s\n' "$out" || echo "brak sesji claude-up"
+    exit 0
+    ;;
 
   --session) need python3; attach_chat "${2:-}"; exit 0 ;;
 
@@ -201,14 +218,10 @@ case "$1" in
     found=0
     while read -r s; do
       [ -n "$s" ] || continue
-      tag="$(tmux show-options -qv -t "=$s" @claude_up 2>/dev/null || true)"
-      cmd="$(tmux list-panes -s -t "=$s" -F '#{pane_start_command}' 2>/dev/null | tr '\n' ' ')"
-      case "$tag$cmd" in
-        1*|*"claude remote-control"*)
-          tmux kill-session -t "=$s" && echo "stopped $s"
-          found=1
-          ;;
-      esac
+      if is_ours "$s"; then
+        tmux kill-session -t "=$s" && echo "stopped $s"
+        found=1
+      fi
     done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
     [ "$found" = 1 ] || echo "brak sesji claude-up"
     exit 0
